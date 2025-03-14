@@ -13,7 +13,8 @@ from typing import Optional
 from pydantic import BaseModel, EmailStr
 import pytz
 import io
-
+from typing import Dict, List
+from datetime import datetime, timedelta
 # Configurar la zona horaria de Colombia
 colombia_tz = pytz.timezone('America/Bogota')
 
@@ -53,6 +54,15 @@ class Attendance(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"))
     check_in = Column(DateTime, default=lambda: datetime.now(colombia_tz))
+
+
+class NonWorkingDay(Base):
+    __tablename__ = "non_working_days"
+    id = Column(Integer, primary_key=True, index=True)
+    date = Column(DateTime, nullable=False)
+    description = Column(String(200), nullable=False)
+    type = Column(String(50), nullable=False)  # 'holiday', 'vacation', 'special'
+    created_at = Column(DateTime, default=lambda: datetime.now(colombia_tz))
 
 # Modelos Pydantic
 class UserCreate(BaseModel):
@@ -94,6 +104,19 @@ def get_db():
         yield db
     finally:
         db.close()
+
+# Función auxiliar para verificar si un día es laborable
+def is_working_day(date: datetime, non_working_days: List[datetime]) -> bool:
+    # Verificar si es fin de semana (5 = sábado, 6 = domingo)
+    if date.weekday() in [5, 6]:
+        return False
+    
+    # Verificar si es un día no laborable (festivo, vacación, etc.)
+    date_without_time = date.date()
+    if any(d.date() == date_without_time for d in non_working_days):
+        return False
+    
+    return True
 
 # Función auxiliar para obtener la fecha actual en Colombia
 def get_current_colombia_time():
@@ -198,6 +221,7 @@ async def recognize_face(
                     "role_id": user.role_id,
                     "grade_id": user.grade_id,
                     "check_in": existing_attendance.check_in,
+                    "document_number": user.document_number,
                     "already_registered": True,
                     # Convertir imagen a base64 para enviar al frontend
                     "face_image": f"data:image/jpeg;base64,{user.face_image.hex()}" if user.face_image else None
@@ -231,6 +255,169 @@ def get_grades_by_level(db: Session = Depends(get_db)):
     for level in levels:
         grades_by_level[level[0]] = db.query(Grade).filter(Grade.level == level[0]).all()
     return grades_by_level
+
+# Modificar la función get_attendance_by_date_range
+@app.get("/attendance/")
+async def get_attendance_by_date_range(
+    start_date: str,
+    end_date: str,
+    db: Session = Depends(get_db)
+):
+    try:
+        start = datetime.strptime(start_date, "%Y-%m-%d").replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        end = datetime.strptime(end_date, "%Y-%m-%d").replace(
+            hour=23, minute=59, second=59, microsecond=999999
+        )
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format")
+
+    # Obtener todos los días no laborables en el rango
+    non_working_days = db.query(NonWorkingDay.date).filter(
+        NonWorkingDay.date >= start,
+        NonWorkingDay.date <= end
+    ).all()
+    non_working_dates = [d.date for d in non_working_days]
+
+    # Calcular días hábiles en el rango
+    def count_working_days(start_date, end_date, non_working_dates):
+        current = start_date
+        working_days = 0
+        while current <= end_date:
+            if is_working_day(current, non_working_dates):
+                working_days += 1
+            current += timedelta(days=1)
+        return working_days
+
+    total_working_days = count_working_days(start, end, non_working_dates)
+    
+    # Obtener el total de usuarios
+    total_users = db.query(User).count()
+    
+    # Obtener usuarios únicos que registraron asistencia en días hábiles
+    present_users_query = db.query(
+        func.count(func.distinct(Attendance.user_id))
+    ).filter(
+        Attendance.check_in >= start,
+        Attendance.check_in <= end
+    )
+    present_users = present_users_query.scalar() or 0
+    
+    # Calcular ausentes
+    absent_users = total_users - present_users
+
+    # Obtener todos los usuarios
+    users = db.query(User).all()
+    
+    # Obtener todas las asistencias para el rango de fechas
+    all_attendances = db.query(Attendance).filter(
+        Attendance.check_in >= start,
+        Attendance.check_in <= end
+    ).all()
+
+    # Crear un diccionario de asistencias por usuario
+    attendance_by_user = {}
+    for attendance in all_attendances:
+        # Solo contar asistencias en días hábiles
+        if is_working_day(attendance.check_in, non_working_dates):
+            if attendance.user_id not in attendance_by_user:
+                attendance_by_user[attendance.user_id] = []
+            attendance_by_user[attendance.user_id].append(attendance.check_in.date())
+
+    # Organizar usuarios por rol con información de inasistencias
+    attendance_by_role = {}
+    
+    for user in users:
+        user_attendances = attendance_by_user.get(user.id, [])
+        days_attended = len(set(user_attendances))  # Usar set para contar días únicos
+        days_absent = total_working_days - days_attended
+        
+        # Solo incluir usuarios con inasistencias en días hábiles
+        if days_absent > 0:
+            if user.role_id not in attendance_by_role:
+                attendance_by_role[user.role_id] = []
+            
+            last_attendance = max(user_attendances) if user_attendances else None
+            
+            user_data = {
+                "id": user.id,
+                "document_number": user.document_number,
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+                "email": user.email,
+                "role_id": user.role_id,
+                "grade_id": user.grade_id,
+                "daysAbsent": days_absent,
+                "check_in": last_attendance
+            }
+            
+            attendance_by_role[user.role_id].append(user_data)
+    
+    return {
+        "stats": {
+            "total": total_users,
+            "present": present_users,
+            "absent": absent_users,
+            "total_working_days": total_working_days
+        },
+        "attendance_by_role": attendance_by_role
+    }
+
+# Nueva ruta para gestionar días no laborables
+@app.post("/non-working-days/")
+async def create_non_working_day(
+    date: str = Form(...),
+    description: str = Form(...),
+    type: str = Form(...),
+    db: Session = Depends(get_db)
+):
+    print(f"Received data: date={date}, description={description}, type={type}")
+    
+    try:
+        non_working_date = datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format")
+    
+    db_non_working_day = NonWorkingDay(
+        date=non_working_date,
+        description=description,
+        type=type
+    )
+    db.add(db_non_working_day)
+    db.commit()
+    return {"message": "Non-working day created successfully"}
+
+@app.get("/non-working-days/")
+async def get_non_working_days(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    query = db.query(NonWorkingDay)
+    
+    if start_date and end_date:
+        try:
+            start = datetime.strptime(start_date, "%Y-%m-%d")
+            end = datetime.strptime(end_date, "%Y-%m-%d")
+            query = query.filter(NonWorkingDay.date >= start, NonWorkingDay.date <= end)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format")
+    
+    return query.all()
+
+@app.delete("/non-working-days/{day_id}")
+async def delete_non_working_day(
+    day_id: int,
+    db: Session = Depends(get_db)
+):
+    non_working_day = db.query(NonWorkingDay).filter(NonWorkingDay.id == day_id).first()
+    if not non_working_day:
+        raise HTTPException(status_code=404, detail="Day not found")
+    
+    db.delete(non_working_day)
+    db.commit()
+    return {"message": "Non-working day deleted successfully"}
 
 if __name__ == "__main__":
     import uvicorn

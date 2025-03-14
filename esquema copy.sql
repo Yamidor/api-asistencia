@@ -62,3 +62,12 @@ CREATE TABLE attendance (
     check_in TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (user_id) REFERENCES users(id)
 );
+
+CREATE TABLE IF NOT EXISTS non_working_days (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    date DATE NOT NULL,
+    description VARCHAR(200) NOT NULL,
+    type VARCHAR(50) NOT NULL CHECK (type IN ('holiday', 'vacation', 'special')),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY unique_date (date)
+);
